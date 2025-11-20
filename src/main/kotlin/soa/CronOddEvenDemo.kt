@@ -3,18 +3,29 @@
 package soa
 
 import org.slf4j.LoggerFactory
+import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.beans.factory.annotation.Qualifier
 import org.springframework.boot.autoconfigure.SpringBootApplication
 import org.springframework.boot.runApplication
 import org.springframework.context.annotation.Bean
+import org.springframework.context.annotation.Lazy
 import org.springframework.integration.annotation.Gateway
 import org.springframework.integration.annotation.MessagingGateway
 import org.springframework.integration.annotation.ServiceActivator
+import org.springframework.integration.channel.QueueChannel
 import org.springframework.integration.config.EnableIntegration
 import org.springframework.integration.dsl.IntegrationFlow
 import org.springframework.integration.dsl.MessageChannels
 import org.springframework.integration.dsl.Pollers
 import org.springframework.integration.dsl.PublishSubscribeChannelSpec
 import org.springframework.integration.dsl.integrationFlow
+import org.springframework.integration.handler.advice.RequestHandlerRetryAdvice
+import org.springframework.integration.support.MessageBuilder
+import org.springframework.messaging.Message
+import org.springframework.messaging.MessageChannel
+import org.springframework.retry.backoff.ExponentialBackOffPolicy
+import org.springframework.retry.policy.SimpleRetryPolicy
+import org.springframework.retry.support.RetryTemplate
 import org.springframework.scheduling.annotation.EnableScheduling
 import org.springframework.scheduling.annotation.Scheduled
 import org.springframework.stereotype.Component
@@ -38,7 +49,13 @@ private val logger = LoggerFactory.getLogger("soa.CronOddEvenDemo")
 class IntegrationApplication(
     private val sendNumber: SendNumber,
     private val sendBatch: SendBatch,
+    private val sendRiskyNumber: SendRiskyNumber,
 ) {
+    @Autowired
+    @Qualifier("deadLetterChannel")
+    @Lazy
+    lateinit var dlq: MessageChannel
+
     /**
      * Creates an atomic integer source that generates sequential numbers.
      */
@@ -58,6 +75,49 @@ class IntegrationApplication(
      */
     @Bean
     fun splitNumberChannel() = MessageChannels.executor(Executors.newVirtualThreadPerTaskExecutor())
+
+    /**
+     * Dead Letter Channel for storing messages that fail after all retry attempts.
+     */
+    @Bean
+    fun deadLetterChannel(): MessageChannel = QueueChannel()
+
+    /**
+     * Retry advice configuration with exponential backoff policy.
+     * Retries up to 3 times with exponential delay between attempts.
+     */
+    @Bean
+    fun retryAdvice(): RequestHandlerRetryAdvice {
+        val retryTemplate =
+            RetryTemplate().apply {
+                setRetryPolicy(SimpleRetryPolicy().apply { maxAttempts = 3 })
+                setBackOffPolicy(
+                    ExponentialBackOffPolicy().apply {
+                        initialInterval = 400
+                        multiplier = 1.5
+                        maxInterval = 5000
+                    },
+                )
+            }
+
+        return RequestHandlerRetryAdvice().apply {
+            setRetryTemplate(retryTemplate)
+            setRecoveryCallback { context ->
+                val failedMessage = context.getAttribute("message") as? Message<*>
+                val errorMessage =
+                    MessageBuilder
+                        .withPayload(failedMessage?.payload ?: "UNKNOWN")
+                        .setHeader("error", context.lastThrowable?.message)
+                        .setHeader("exceptionType", context.lastThrowable?.javaClass?.name)
+                        .setHeader("errorTimestamp", System.currentTimeMillis())
+                        .setHeader("failedMessage", failedMessage)
+                        .build()
+                dlq.send(errorMessage)
+                logger.error("Retry exhausted for message: {}, sending to DLQ", failedMessage?.payload)
+                errorMessage
+            }
+        }
+    }
 
     /**
      * Source flow that polls the integer source and sends to numberChannel.
@@ -215,6 +275,60 @@ class IntegrationApplication(
                 logger.info("Batch Result Handler: Final aggregated result = {}", p.payload)
             }
         }
+
+    /**
+     * Scheduled task that sends risky numbers every 3 seconds to test error handling.
+     */
+    @Scheduled(fixedRate = 3000, initialDelay = 4000)
+    fun sendRiskyNumbers() {
+        val riskyNumbers = listOf(0, 13, 666, 7, 42, 99)
+        val number = riskyNumbers.random()
+        logger.info("Risky Gateway: Sending number {} for processing", number)
+        sendRiskyNumber.sendRiskyNumber(number)
+    }
+
+    /**
+     * Risky number processing flow with retry advice.
+     */
+    @Bean
+    fun riskyIngressFlow(
+        retryAdvice: RequestHandlerRetryAdvice,
+        handler: RiskyNumberHandler,
+    ): IntegrationFlow =
+        integrationFlow("riskyIngressChannel") {
+            handle<Int>(
+                { payload, headers ->
+                    // Only handler execution is subject to retries
+                    handler.processRiskyNumber(payload)
+                },
+            ) {
+                // If processRiskyNumber throws exception, retryAdvice triggers RetryTemplate and retries as configured
+                // After exhausting attempts, retryAdvice executes the recoveryCallback
+                // defined above (which will send to the DLQ)
+                advice(retryAdvice)
+            }
+        }
+
+    /**
+     * Dead Letter Queue flow for handling failed messages.
+     */
+    @Bean
+    fun deadLetterFlow(): IntegrationFlow =
+        integrationFlow {
+            channel("deadLetterChannel")
+            handle { msg ->
+                val originalMessage = msg.headers["originalMessage"] as? Message<*>
+                logger.error("DLQ: Received failed message - Payload: {}", originalMessage?.payload)
+                logger.error("Error: {}", msg.headers["error"])
+                logger.error("All retries exhausted, message permanently failed")
+            }
+        }
+
+    /**
+     * Handler bean for processing risky numbers.
+     */
+    @Bean
+    fun riskyNumberHandler() = RiskyNumberHandler()
 }
 
 /**
@@ -247,6 +361,44 @@ interface SendNumber {
 interface SendBatch {
     @Gateway(requestChannel = "batchChannel")
     fun sendBatch(numbers: List<Int>)
+}
+
+/**
+ * Messaging Gateway for sending risky numbers that may fail.
+ */
+@MessagingGateway
+interface SendRiskyNumber {
+    @Gateway(requestChannel = "riskyIngressChannel")
+    fun sendRiskyNumber(number: Int)
+}
+
+/**
+ * Handler component for processing risky numbers with potential failures.
+ */
+@Component
+class RiskyNumberHandler {
+    fun processRiskyNumber(payload: Int): Int {
+        logger.info("Handler: Processing number {}", payload)
+
+        return when (payload) {
+            0 -> {
+                logger.error("ERROR Handler: Cannot process zero")
+                throw IllegalArgumentException("Zero is not allowed")
+            }
+            13 -> {
+                logger.error("ERROR Handler: Unlucky number 13")
+                throw IllegalStateException("Unlucky number")
+            }
+            666 -> {
+                logger.error("ERROR Handler: Invalid number 666")
+                throw RuntimeException("Invalid number")
+            }
+            else -> {
+                logger.info("Handler: Successfully processed number {}", payload)
+                payload
+            }
+        }
+    }
 }
 
 fun main() {
