@@ -133,6 +133,7 @@ class IntegrationApplication(
                 logger.info("📥 Source generated number: {}", num)
                 num
             }
+            wireTap("tapChannel")
             channel("numberChannel")
         }
 
@@ -142,6 +143,7 @@ class IntegrationApplication(
     @Bean
     fun numberFlow(): IntegrationFlow =
         integrationFlow("numberChannel") {
+            wireTap("tapChannel")
             route { p: Int ->
                 val channel = if (p % 2 == 0) "evenChannel" else "oddChannel"
                 logger.info("🔀 Router: {} → {}", p, channel)
@@ -160,6 +162,7 @@ class IntegrationApplication(
                 logger.info("  ⚙️  Even Transformer: {} → 'Number {}'", obj, obj)
                 "Number $obj"
             }
+            wireTap("tapChannel")
             handle { p ->
                 logger.info("  ✅ Even Handler: Processed [{}]", p.payload)
             }
@@ -182,6 +185,7 @@ class IntegrationApplication(
                 logger.info("  ⚙️  Odd Transformer: {} → 'Number {}'", obj, obj)
                 "Number $obj"
             }
+            wireTap("tapChannel")
             handle { p ->
                 logger.info("  ✅ Odd Handler: Processed [{}]", p.payload)
             }
@@ -217,12 +221,14 @@ class IntegrationApplication(
     @Bean
     fun batchSplitterFlow(): IntegrationFlow =
         integrationFlow("batchChannel") {
+            wireTap("tapChannel")
             // Each number in the batch is split into its own message
             split()
             transform { num: Int ->
                 logger.info("Splitter: Split out number {}", num)
                 num
             }
+            wireTap("tapChannel")
             channel("splitNumberChannel")
         }
 
@@ -275,6 +281,8 @@ class IntegrationApplication(
                 logger.info("Batch Result Handler: Final aggregated result = {}", p.payload)
             }
         }
+
+    // ========== Retry and Dead Letter Pattern ==========
 
     /**
      * Scheduled task that sends risky numbers every 3 seconds to test error handling.
@@ -329,6 +337,33 @@ class IntegrationApplication(
      */
     @Bean
     fun riskyNumberHandler() = RiskyNumberHandler()
+
+    // ========== Wire Tap Pattern ==========
+
+    /**
+     * Wire Tap monitoring flow for observing messages without affecting the main flow.
+     * Implements the Wire Tap EIP pattern for non-intrusive monitoring.
+     */
+    @Bean
+    fun wireTapFlow(): IntegrationFlow =
+        integrationFlow {
+            channel("tapChannel")
+            handle { msg ->
+                val payload = msg.payload
+                val payloadType = payload?.javaClass?.simpleName ?: "Unknown"
+                logger.info("Wire Tap: Monitoring message. Payload: {} (Type: {})", payload, payloadType)
+
+                // Additional monitoring, track message headers
+                val interestingHeaders =
+                    msg.headers.filterKeys {
+                        // Exclude standard headers to focus on custom ones
+                        it !in listOf("id", "timestamp")
+                    }
+                if (interestingHeaders.isNotEmpty()) {
+                    logger.info("Wire Tap: Headers: {}", interestingHeaders)
+                }
+            }
+        }
 }
 
 /**
