@@ -18,6 +18,7 @@ import org.springframework.integration.dsl.integrationFlow
 import org.springframework.scheduling.annotation.EnableScheduling
 import org.springframework.scheduling.annotation.Scheduled
 import org.springframework.stereotype.Component
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.random.Random
 
@@ -36,6 +37,7 @@ private val logger = LoggerFactory.getLogger("soa.CronOddEvenDemo")
 @EnableScheduling
 class IntegrationApplication(
     private val sendNumber: SendNumber,
+    private val sendBatch: SendBatch,
 ) {
     /**
      * Creates an atomic integer source that generates sequential numbers.
@@ -49,6 +51,13 @@ class IntegrationApplication(
      */
     @Bean
     fun oddChannel(): PublishSubscribeChannelSpec<*> = MessageChannels.publishSubscribe()
+
+    /**
+     * Creates an executor channel for parallel processing of split messages.
+     * Uses virtual threads (lightweight threads) for concurrent message processing.
+     */
+    @Bean
+    fun splitNumberChannel() = MessageChannels.executor(Executors.newVirtualThreadPerTaskExecutor())
 
     /**
      * Source flow that polls the integer source and sends to numberChannel.
@@ -127,6 +136,85 @@ class IntegrationApplication(
         logger.info("🚀 Gateway injecting: {}", number)
         sendNumber.sendNumber(number)
     }
+
+    // ========== Splitter and Aggregator Pattern ==========
+
+    /**
+     * Scheduled task that sends batches of numbers every 5 seconds after an initial delay of 2 seconds.
+     */
+    @Scheduled(fixedRate = 5000, initialDelay = 2000)
+    fun sendBatchNumbers() {
+        val batch = List(5) { Random.nextInt(1, 100) }
+        logger.info("Batch Gateway: Sending batch of {} numbers: {}", batch.size, batch)
+        sendBatch.sendBatch(batch)
+    }
+
+    /**
+     * Splitter flow: Splits a batch of numbers into individual messages.
+     * Each number is processed independently in parallel.
+     * Implements the Splitter EIP pattern.
+     */
+    @Bean
+    fun batchSplitterFlow(): IntegrationFlow =
+        integrationFlow("batchChannel") {
+            // Each number in the batch is split into its own message
+            split()
+            transform { num: Int ->
+                logger.info("Splitter: Split out number {}", num)
+                num
+            }
+            channel("splitNumberChannel")
+        }
+
+    /**
+     * Process each split number independently in parallel using virtual threads.
+     * Squares each number to demonstrate concurrent processing.
+     * Simulates some processing time to show parallelism.
+     */
+    @Bean
+    fun processSplitNumbersFlow(): IntegrationFlow =
+        integrationFlow("splitNumberChannel") {
+            transform { num: Int ->
+                // Simulate some computation time to demonstrate parallel processing
+                val startTime = System.currentTimeMillis()
+                Thread.sleep(100) // Simulated processing delay
+                val squared = num * num
+                val processingTime = System.currentTimeMillis() - startTime
+                logger.info(
+                    "Processor: $num squared = $squared " +
+                        "[Time: ${processingTime}ms]",
+                )
+                squared
+            }
+            channel("aggregateChannel")
+        }
+
+    /**
+     * Aggregator flow: Collects all processed numbers and consolidates them.
+     * Waits until all split messages are received, then aggregates the results.
+     * Implements the Aggregator EIP pattern.
+     */
+    @Bean
+    fun aggregatorFlow(): IntegrationFlow =
+        integrationFlow("aggregateChannel") {
+            // Spring Integration will automatically group messages that belong together based on correlation.
+            aggregate()
+            transform { payload: Any ->
+                val numbers = (payload as? List<*>)?.mapNotNull { it as? Int } ?: emptyList()
+                val sum = numbers.sum()
+                val avg = if (numbers.isNotEmpty()) sum / numbers.size else 0
+                logger.info("Aggregator: Collected {} squared values, sum={}, avg={}", numbers.size, sum, avg)
+                mapOf(
+                    "count" to numbers.size,
+                    "values" to numbers,
+                    "sum" to sum,
+                    "average" to avg,
+                )
+            }
+            handle { p ->
+                logger.info("Batch Result Handler: Final aggregated result = {}", p.payload)
+            }
+        }
 }
 
 /**
@@ -149,6 +237,16 @@ class SomeService {
 interface SendNumber {
     @Gateway(requestChannel = "numberChannel")
     fun sendNumber(number: Int)
+}
+
+/**
+ * Messaging Gateway for sending batches of numbers.
+ * Used to demonstrate the Splitter and Aggregator pattern.
+ */
+@MessagingGateway
+interface SendBatch {
+    @Gateway(requestChannel = "batchChannel")
+    fun sendBatch(numbers: List<Int>)
 }
 
 fun main() {
