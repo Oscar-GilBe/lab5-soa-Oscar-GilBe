@@ -129,6 +129,11 @@ class IntegrationApplication(
             source = { integerSource.getAndIncrement() },
             options = { poller(Pollers.fixedRate(100)) },
         ) {
+            // Content Enricher, add metadata to messages
+            enrichHeaders {
+                header("messageSource", "PollingSource")
+                header("messageType", "SequentialNumber")
+            }
             transform { num: Int ->
                 logger.info("📥 Source generated number: {}", num)
                 num
@@ -143,6 +148,11 @@ class IntegrationApplication(
     @Bean
     fun numberFlow(): IntegrationFlow =
         integrationFlow("numberChannel") {
+            // Content Enricher, add routing context
+            enrichHeaders {
+                headerExpression("routingTimestamp", "T(System).currentTimeMillis()")
+                header("routerName", "EvenOddRouter")
+            }
             wireTap("tapChannel")
             route { p: Int ->
                 val channel = if (p % 2 == 0) "evenChannel" else "oddChannel"
@@ -158,13 +168,26 @@ class IntegrationApplication(
     @Bean
     fun evenFlow(): IntegrationFlow =
         integrationFlow("evenChannel") {
+            // Content Enricher, add processing metadata
+            enrichHeaders {
+                header("parity", "EVEN")
+                header("processingPath", "EvenFlow")
+                headerExpression("processingStartTime", "T(System).currentTimeMillis()")
+            }
             transform { obj: Int ->
                 logger.info("  ⚙️  Even Transformer: {} → 'Number {}'", obj, obj)
                 "Number $obj"
             }
+            // Enrich with transformation completion time
+            enrichHeaders {
+                headerExpression("transformationCompletedAt", "T(System).currentTimeMillis()")
+            }
             wireTap("tapChannel")
             handle { p ->
-                logger.info("  ✅ Even Handler: Processed [{}]", p.payload)
+                val startTime = p.headers["processingStartTime"] as? Long
+                val endTime = p.headers["transformationCompletedAt"] as? Long
+                val duration = if (startTime != null && endTime != null) endTime - startTime else 0
+                logger.info("  ✅ Even Handler: Processed [{}] (duration: {}ms)", p.payload, duration)
             }
         }
 
@@ -175,19 +198,37 @@ class IntegrationApplication(
     @Bean
     fun oddFlow(): IntegrationFlow =
         integrationFlow("oddChannel") {
+            // Content Enricher, add processing metadata
+            enrichHeaders {
+                header("parity", "ODD")
+                header("processingPath", "OddFlow")
+                headerExpression("processingStartTime", "T(System).currentTimeMillis()")
+            }
             filter { p: Int ->
                 val passes = p % 2 != 0
                 // Note: this filter always pass all numbers because p is always odd here. This filter could be removed.
                 logger.info("  🔍 Odd Filter: checking {} → {}", p, if (passes) "PASS" else "REJECT")
                 passes
             }
+            // Enrich with filter result
+            enrichHeaders {
+                header("filterPassed", true)
+                headerExpression("filterCompletedAt", "T(System).currentTimeMillis()")
+            }
             transform { obj: Int ->
                 logger.info("  ⚙️  Odd Transformer: {} → 'Number {}'", obj, obj)
                 "Number $obj"
             }
+            // Enrich with transformation completion time
+            enrichHeaders {
+                headerExpression("transformationCompletedAt", "T(System).currentTimeMillis()")
+            }
             wireTap("tapChannel")
             handle { p ->
-                logger.info("  ✅ Odd Handler: Processed [{}]", p.payload)
+                val startTime = p.headers["processingStartTime"] as? Long
+                val endTime = p.headers["transformationCompletedAt"] as? Long
+                val duration = if (startTime != null && endTime != null) endTime - startTime else 0
+                logger.info("  ✅ Odd Handler: Processed [{}] (duration: {}ms)", p.payload, duration)
             }
         }
 
@@ -221,9 +262,21 @@ class IntegrationApplication(
     @Bean
     fun batchSplitterFlow(): IntegrationFlow =
         integrationFlow("batchChannel") {
+            // Content Enricher, add batch metadata
+            enrichHeaders {
+                header("batchSource", "BatchGateway")
+                headerExpression("batchReceivedAt", "T(System).currentTimeMillis()")
+                headerFunction<Int>("batchSize") { message ->
+                    (message.payload as? List<*>)?.size ?: 0
+                }
+            }
             wireTap("tapChannel")
             // Each number in the batch is split into its own message
             split()
+            // Enrich each split message
+            enrichHeaders {
+                header("splitFrom", "BatchSplitter")
+            }
             transform { num: Int ->
                 logger.info("Splitter: Split out number {}", num)
                 num
@@ -325,8 +378,8 @@ class IntegrationApplication(
         integrationFlow {
             channel("deadLetterChannel")
             handle { msg ->
-                val originalMessage = msg.headers["originalMessage"] as? Message<*>
-                logger.error("DLQ: Received failed message - Payload: {}", originalMessage?.payload)
+                val failedMessage = msg.headers["failedMessage"] as? Message<*>
+                logger.error("DLQ: Received failed message - Payload: {}", failedMessage?.payload)
                 logger.error("Error: {}", msg.headers["error"])
                 logger.error("All retries exhausted, message permanently failed")
             }
@@ -343,6 +396,7 @@ class IntegrationApplication(
     /**
      * Wire Tap monitoring flow for observing messages without affecting the main flow.
      * Implements the Wire Tap EIP pattern for non-intrusive monitoring.
+     * Shows enriched headers added by Content Enricher pattern.
      */
     @Bean
     fun wireTapFlow(): IntegrationFlow =
@@ -353,14 +407,14 @@ class IntegrationApplication(
                 val payloadType = payload?.javaClass?.simpleName ?: "Unknown"
                 logger.info("Wire Tap: Monitoring message. Payload: {} (Type: {})", payload, payloadType)
 
-                // Additional monitoring, track message headers
-                val interestingHeaders =
+                // Show enriched headers (Content Enricher metadata)
+                val enrichedHeaders =
                     msg.headers.filterKeys {
                         // Exclude standard headers to focus on custom ones
-                        it !in listOf("id", "timestamp")
+                        it !in listOf("id", "timestamp", "replyChannel", "errorChannel")
                     }
-                if (interestingHeaders.isNotEmpty()) {
-                    logger.info("Wire Tap: Headers: {}", interestingHeaders)
+                if (enrichedHeaders.isNotEmpty()) {
+                    logger.info("Wire Tap: Enriched Headers: {}", enrichedHeaders)
                 }
             }
         }
