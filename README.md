@@ -60,28 +60,28 @@ See `docs/GUIDE.md` for detailed instructions.
 
 Be the first to complete **at least two** of the following tasks to earn a bonus:
 
-### 1. **Content Enricher Pattern**
+### 1. **Content Enricher Pattern** ✅
 
 - **Description**: Implement a Content Enricher that adds additional data to messages as they flow through the system.
 - **Implementation**: Add a content enricher that augments messages with metadata (timestamp, message ID, or external data lookup).
 - **Goal**: Demonstrate understanding of the Content Enricher pattern for message enhancement.
 - **Benefit**: Shows mastery of message enrichment patterns in integration scenarios.
 
-### 2. **Splitter and Aggregator**
+### 2. **Splitter and Aggregator** ✅
 
 - **Description**: Implement message Splitter and Aggregator patterns to process composite messages.
 - **Implementation**: Split a batch of numbers into individual messages, process them separately, then aggregate results.
 - **Goal**: Master composite message processing patterns.
 - **Benefit**: Demonstrates understanding of parallel processing and result consolidation in integration flows.
 
-### 3. **Dead Letter Channel**
+### 3. **Dead Letter Channel** ✅
 
 - **Description**: Implement proper error handling with a Dead Letter Channel for failed messages.
 - **Implementation**: Add error handling that routes failed messages to a dead letter channel with retry logic.
 - **Goal**: Implement robust error handling in integration flows.
 - **Benefit**: Shows understanding of enterprise-grade error handling and recovery patterns.
 
-### 4. **Wire Tap**
+### 4. **Wire Tap** ✅
 
 - **Description**: Implement a Wire Tap to monitor messages without affecting the main flow.
 - **Implementation**: Add wire taps to observe message content at key points without altering flow behavior.
